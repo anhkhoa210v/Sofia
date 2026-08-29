@@ -17,7 +17,11 @@ from .logger import get_logger
 
 log = get_logger()
 
-_TUNNEL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+_TUNNEL_RE = re.compile(r"https://[a-z0-9-]{10,}\.trycloudflare\.com")
+# Hosts that are part of the Cloudflare control plane, never a quick tunnel.
+_BANNED_TUNNEL_HOSTS = {"api.trycloudflare.com", "help.trycloudflare.com",
+                        "developers.trycloudflare.com", "dash.trycloudflare.com",
+                        "www.trycloudflare.com"}
 
 
 def find_cloudflared() -> Optional[str]:
@@ -80,6 +84,9 @@ def start_tunnel(oob_port: int, binary: Optional[str] = None,
         m = _TUNNEL_RE.search(line)
         if m:
             url = m.group(0)
+            host = url.split("//", 1)[1].split("/", 1)[0]
+            if host in _BANNED_TUNNEL_HOSTS or host.startswith("api."):
+                continue
             log.info(f"Cloudflare tunnel ready: {url}")
             return Tunnel(url, proc)
         if "error" in line.lower() and "quic" not in line.lower():
@@ -91,4 +98,5 @@ def start_tunnel(oob_port: int, binary: Optional[str] = None,
     except Exception:
         pass
     return None
+
 

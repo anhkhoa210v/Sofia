@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .http import HttpClient
 from .logger import get_logger
@@ -29,9 +29,13 @@ class BaselineEngine:
         self.client = client
 
     def run(self, endpoints: List[Endpoint],
-            classifications: Dict[str, Classification]) -> Dict[str, Baseline]:
+            classifications: Dict[str, Classification],
+            should_stop: Optional[Callable[[], bool]] = None) -> Dict[str, Baseline]:
+        should_stop = should_stop or (lambda: False)
         out: Dict[str, Baseline] = {}
         for ep in endpoints:
+            if should_stop():
+                break
             cls = classifications.get(ep.uid())
             if cls is None:
                 continue
@@ -100,5 +104,7 @@ def baseline_matches(b: Baseline, status: int, length: int, ctype: str,
         if ctype.split(";")[0].strip() != b.content_type.split(";")[0].strip():
             return False
     return True
+
+
 
 

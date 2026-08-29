@@ -128,21 +128,44 @@ def normalize_engine(name: Optional[str]) -> str:
 def payloads_for_capabilities(caps: Dict[str, bool], tier: RiskTier) -> List[str]:
     """Select payload kinds permitted by the target's capabilities and risk tier."""
     kinds: List[str] = []
+    # In-band file reads need DOCTYPE + general entity + file:// resolution.
+    file_read = bool(
+        caps.get("dtd", False) and caps.get("entity", False)
+        and caps.get("external_entity", False) and caps.get("file_scheme", False)
+    )
     if caps.get("dtd", False):
         if caps.get("entity", False):
             kinds.append("internal_entity")
         if caps.get("external_entity", False) and caps.get("network", False):
             kinds.append("oob_probe_http")
             if tier.allow_oob:
+                kinds.append("oob_probe_https")
                 kinds.append("oob_parameter_entity")
+                kinds.append("oob_general_entity_dtd")
+                kinds.append("cosmicsting_svg")
+                kinds.append("xlsx_upload")
                 if tier.allow_exfil:
                     kinds.append("oob_file_exfil")
+        if file_read and tier.allow_exfil:
+            kinds.append("file_read_inband")
+            kinds.append("param_entity_file_read")
         if caps.get("error_reflection", False):
             kinds.append("error_based")
     if caps.get("xinclude", False) and tier.allow_xinclude:
         kinds.append("xinclude")
+        if file_read and tier.allow_exfil:
+            kinds.append("xinclude_file")
     if caps.get("xslt", False) and tier.allow_xslt:
         kinds.append("xslt")
+        if tier.allow_oob:
+            kinds.append("xslt_oob")
+    if file_read and tier.allow_exfil:
+        # Format-specific in-band file reads; the endpoint kind map decides
+        # which formats apply to the probed endpoint.
+        kinds.append("svg_file_read")
+        kinds.append("soap_file_read")
+        kinds.append("json_xml_chain_file")
+        kinds.append("docx_file_read")
     if caps.get("resource_limit", False) and tier.allow_entity_expansion:
         kinds.append("entity_expansion")
     return dedupe(kinds)
@@ -151,19 +174,25 @@ def payloads_for_capabilities(caps: Dict[str, bool], tier: RiskTier) -> List[str
 def payloads_for_endpoint_kind(endpoint_kind: str, selected: List[str]) -> List[str]:
     """Map payload kinds appropriate to the endpoint XML kind."""
     allowed: Dict[str, List[str]] = {
-        "xml_direct": ["internal_entity", "oob_probe_http", "oob_parameter_entity",
-                       "oob_file_exfil", "error_based", "xinclude", "xslt",
-                       "entity_expansion"],
-        "soap": ["soap_entity", "oob_parameter_entity", "oob_file_exfil",
-                 "error_based"],
-        "json_to_xml": ["json_xml_chain", "oob_parameter_entity"],
-        "multipart_upload": ["docx_upload", "svg_entity"],
-        "svg": ["svg_entity", "internal_entity"],
+        "xml_direct": ["internal_entity", "oob_probe_http", "oob_probe_https",
+                       "oob_parameter_entity", "oob_general_entity_dtd",
+                       "oob_file_exfil", "error_based", "xinclude", "xinclude_file",
+                       "xslt", "xslt_oob", "entity_expansion", "xml_layout_xxe",
+                       "file_read_inband", "param_entity_file_read"],
+        "soap": ["soap_entity", "soap_file_read", "oob_parameter_entity",
+                 "oob_general_entity_dtd", "oob_file_exfil", "error_based"],
+        "json_to_xml": ["json_xml_chain", "json_xml_chain_file",
+                        "oob_parameter_entity", "cosmicsting_svg"],
+        "multipart_upload": ["docx_upload", "docx_file_read", "xlsx_upload",
+                              "svg_entity", "cosmicsting_svg"],
+        "svg": ["svg_entity", "svg_file_read", "internal_entity"],
         "rss": ["rss_entity", "internal_entity"],
-        "docx": ["docx_upload"],
-        "parser_chain": ["internal_entity", "oob_probe_http", "error_based"],
+        "docx": ["docx_upload", "docx_file_read", "xlsx_upload"],
+        "parser_chain": ["internal_entity", "oob_probe_http", "error_based",
+                         "file_read_inband", "param_entity_file_read"],
         "unknown": ["internal_entity", "oob_probe_http", "oob_parameter_entity",
-                    "error_based"],
+                    "oob_general_entity_dtd", "error_based", "file_read_inband",
+                    "param_entity_file_read"],
         "none": [],
     }
     want = allowed.get(endpoint_kind, allowed["unknown"])
@@ -178,4 +207,7 @@ def dedupe(items: List[str]) -> List[str]:
             seen.add(i)
             out.append(i)
     return out
+
+
+
 

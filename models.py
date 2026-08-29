@@ -46,6 +46,14 @@ class ScanConfig:
     verbose: bool = False
     log_file: Optional[str] = None
     extra_param: Optional[str] = None
+    max_pages: int = 200             # crawl cap per scan
+    discovery_timeout: float = 120.0 # seconds budget for discovery/crawl
+    concurrency: int = 5             # parallel test workers (5-10)
+    payload_kinds: Optional[List[str]] = None   # allowlist of payload kinds (None = all)
+    endpoint_kinds: Optional[List[str]] = None  # allowlist of endpoint kinds (None = all)
+    exfil_targets: List[str] = field(default_factory=list)  # custom exfil allowlist (empty = defaults)
+    delay: float = 0.0              # extra delay between test requests (s)
+    oob_wait: float = 6.0           # OOB settle window after tests (s)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -290,6 +298,10 @@ class ScanResult:
     fingerprints: Dict[str, Any] = field(default_factory=dict)
     oob_summary: Dict[str, Any] = field(default_factory=dict)
     aborted: bool = False
+    aborted_reason: str = ""
+    timeout_used: float = 0.0
+    tests_planned: int = 0          # tests scheduled for the test matrix
+    analysis_complete: bool = False  # False when analysis was skipped/aborted
     notes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -303,9 +315,18 @@ class ScanResult:
             "fingerprints": self.fingerprints,
             "oob_summary": self.oob_summary,
             "aborted": self.aborted,
+            "aborted_reason": self.aborted_reason,
+            "timeout_used": self.timeout_used,
+            "tests_planned": self.tests_planned,
+            "analysis_complete": self.analysis_complete,
             "notes": self.notes,
+            "tests_run": len(self.raw_results),
             "test_items": len(self.test_items),
             "raw_results": len(self.raw_results),
         }
+
+
+
+
 
 

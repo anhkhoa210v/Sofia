@@ -129,18 +129,31 @@ def evaluate_cves(version: Optional[str], patch: Optional[str],
                   php_version: Optional[str],
                   parser: Optional[List[str]],
                   endpoint_kinds: List[str],
-                  authenticated: bool = False) -> List[CveCandidate]:
+                  authenticated: bool = False,
+                  is_magento: bool = False) -> List[CveCandidate]:
+    """Return CVE candidates grounded in version/parser evidence.
+
+    S5: a Magento CVE is never emitted without either a matching Magento
+    version or a Magento fingerprint hint (is_magento). "Unknown" is treated
+    as "no basis", not as "possibly vulnerable".
+    """
     candidates: List[CveCandidate] = []
     has_admin = any(k == "admin" for k in endpoint_kinds)
+    parser_has_magento = any("magento" in (p or "").lower()
+                             for p in (parser or []))
     for rule in CVE_DB:
         reason_parts = []
         strength = "WEAK"
         if "PHP" in rule.affected:  # CVE-2023-3823 style: PHP version rule
-            if php_version and _php_vulnerable(php_version):
-                reason_parts.append(f"PHP {php_version} within affected range")
-                strength = "MEDIUM"
-            else:
+            if not php_version:
+                # version unknown: no basis to emit a candidate (S5)
                 continue
+            php_match = _php_match(php_version)
+            if php_match is None:
+                continue
+            _, php_strength, php_reason = php_match
+            reason_parts.append(php_reason)
+            strength = php_strength
         else:
             v = version or (patch and f"2.4.x-p{patch}")
             if rule.auth and not (authenticated or has_admin):
@@ -151,12 +164,15 @@ def evaluate_cves(version: Optional[str], patch: Optional[str],
                                     f"({rule.affected})")
                 strength = "MEDIUM"
             elif v:
-                # version known but outside range: only weak mention
+                # version known but outside range: not vulnerable
                 continue
-            else:
-                reason_parts.append("Magento version unknown - version-independent "
-                                    "matching only")
+            elif is_magento or parser_has_magento:
+                reason_parts.append("Magento detected but version unknown - "
+                                    "version-independent matching only")
                 strength = "WEAK"
+            else:
+                # no Magento evidence at all: do not guess (S5)
+                continue
         candidates.append(CveCandidate(
             cve_id=rule.cve_id, name=rule.name, cvss=rule.cvss, cwe=rule.cwe,
             affected=rule.affected, fixed=rule.fixed, advisory=rule.advisory,
@@ -165,17 +181,32 @@ def evaluate_cves(version: Optional[str], patch: Optional[str],
     return candidates
 
 
-def _php_vulnerable(php_version: str) -> bool:
+def _php_match(php_version: str) -> Optional[tuple]:
+    """Return (vulnerable, strength, reason) or None when not vulnerable."""
     major, minor = _php_major_minor(php_version)
     if major == 8 and minor == 0:
-        return version_in(php_version, high="8.0.30", high_incl=False)
+        if version_in(php_version, high="8.0.30", high_incl=False):
+            return (True, "MEDIUM",
+                    f"PHP {php_version} < 8.0.30 within affected range")
+        return None
     if major == 8 and minor == 1:
-        return version_in(php_version, high="8.1.22", high_incl=False)
+        if version_in(php_version, high="8.1.22", high_incl=False):
+            return (True, "MEDIUM",
+                    f"PHP {php_version} < 8.1.22 within affected range")
+        return None
     if major == 8 and minor == 2:
-        return version_in(php_version, high="8.2.8", high_incl=False)
+        if version_in(php_version, high="8.2.8", high_incl=False):
+            return (True, "MEDIUM",
+                    f"PHP {php_version} < 8.2.8 within affected range")
+        return None
     if major == 7:
-        return True
-    return False
+        # EOL branch: advisory has no backport; conservative WEAK hint only
+        return (True, "WEAK",
+                f"PHP {php_version} (7.x EOL) - affected range unverifiable, "
+                "conservative match")
+    if major == 8 and minor >= 3:
+        return None
+    return (True, "WEAK", f"PHP {php_version} older than any patched branch")
 
 
 def _php_major_minor(v: str) -> tuple:
@@ -219,6 +250,8 @@ def _same_branch(a: str, b: str) -> bool:
 
 def _looks_versioned(s: str) -> bool:
     return bool(re.match(r"^\d+(\.\d+)*(-p\d+)?$", s))
+
+
 
 
 

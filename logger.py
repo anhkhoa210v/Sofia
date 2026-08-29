@@ -64,6 +64,12 @@ class Logger:
     def error(self, msg):
         self._emit("error", msg)
 
+    def exception(self, msg):
+        """Log msg at error level with the current traceback appended."""
+        import traceback
+        tb = traceback.format_exc().strip()
+        self._emit("error", f"{msg}\n{tb}" if tb else msg)
+
     def critical(self, msg):
         self._emit("critical", msg)
 
@@ -107,5 +113,6 @@ def reconfigure(**kw):
                     exist_ok=True)
         _LOGGER._file = open(log_file, "a", encoding="utf-8")
     return _LOGGER
+
 
 

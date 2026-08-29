@@ -38,9 +38,11 @@ class HttpClient:
                  cookies: Optional[Dict[str, str]] = None):
         self.cfg = config
         self.session = requests.Session()
+        # Only idempotent methods are retried: a retried POST would duplicate
+        # side effects and, for OOB tests, double-fire the canary callback.
         retry = Retry(total=2, backoff_factor=0.4,
                       status_forcelist=[429, 500, 502, 503, 504],
-                      allowed_methods=["GET", "POST", "PUT"])
+                      allowed_methods=["GET", "HEAD"])
         adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
@@ -92,6 +94,12 @@ class HttpClient:
     def post(self, url: str, **kw):
         return self.request("POST", url, **kw)
 
+    def post_multipart(self, url: str, files=None, data=None, headers=None,
+                       **kw):
+        """POST with multipart/form-data encoding (file part + fields)."""
+        return self.request("POST", url, files=files, data=data,
+                            headers=headers or {}, **kw)
+
     def get_bytes(self, url: str, timeout: Optional[float] = None) -> Tuple[int, bytes]:
         timeout = timeout or self.cfg.timeout
         self.limiter.wait()
@@ -124,4 +132,5 @@ def norm_path(url: str) -> str:
     if not path.endswith("/"):
         path += "/"
     return f"{p.scheme}://{p.netloc}{path}"
+
 

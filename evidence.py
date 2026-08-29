@@ -32,6 +32,20 @@ _ENV_HINTS = [
     "cache", "redis", "secret", "MAGE_MODE", "'driver'", "search",
 ]
 _PASSWD_HINT = re.compile(r"root:.*:0:0:", re.M)
+# payload kinds that reflect entity/file content into the response
+_REFLECT_KINDS = (
+    "internal_entity", "file_read_inband", "param_entity_file_read",
+    "xinclude_file", "svg_file_read", "soap_file_read",
+    "json_xml_chain_file", "docx_file_read",
+)
+# (marker, file label) pairs for in-band file-read evidence
+_FILE_MARKERS = (
+    ("root:", "/etc/passwd"),
+    ("MAGE_MODE", "env.php"),
+    ("'db'", "env.php"),
+    ("[fonts]", "win.ini"),
+    ("[boot loader]", "boot.ini"),
+)
 
 
 def _canary_for(result: ScanResult, raw: RawResult) -> str:
@@ -78,6 +92,10 @@ def _classify_file_content(text: str) -> Tuple[str, str]:
         return "env.php", text
     if _PASSWD_HINT.search(text):
         return "/etc/passwd", text
+    if "[fonts]" in text:
+        return "win.ini", text
+    if "[boot loader]" in text:
+        return "boot.ini", text
     return "file", text
 
 
@@ -191,18 +209,20 @@ class EvidenceClassifier:
             if re.search(r"SOFIA\[[0-9a-f]{10}\]", body) and "/etc/hostname" in kind:
                 pass  # handled below
 
-        # 4) internal entity echo with reflected file content
-        if kind == "internal_entity" and body:
-            if _PASSWD_HINT.search(body) or "root:" in body:
-                return PrimitiveEvidence(
-                    primitive="file_read", strength="MEDIUM",
-                    detail=f"internal_entity|file echoed in response:{_snippet(body, 200)}",
-                    proof=["/etc/hostname entity reflected"],
-                )
+        # 4) in-band reflection: file content or canary echoed in the response
+        if kind in _REFLECT_KINDS and body:
+            for marker, label in _FILE_MARKERS:
+                if marker in body:
+                    return PrimitiveEvidence(
+                        primitive="file_read", strength="MEDIUM",
+                        detail=f"{kind}|{label} echoed in response:"
+                               f"{_snippet(body, 200)}",
+                        proof=[f"marker '{marker}' in response body"],
+                    )
             if re.search(r"SOFIA\[[0-9a-f]{10}\]", body):
                 return PrimitiveEvidence(
                     primitive="entity", strength="MEDIUM",
-                    detail=f"internal_entity|entity expansion reflected",
+                    detail=f"{kind}|entity expansion reflected",
                     proof=["SOFIA canary echoed in response"],
                 )
 
@@ -230,6 +250,7 @@ def _snippet(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "..."
+
 
 
 
